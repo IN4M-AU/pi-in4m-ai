@@ -40,6 +40,9 @@ interface RemoteModel {
 	max_output_tokens?: number;
 	object?: string;
 	owned_by?: string;
+	/** Gateway-supplied capability tag. The IN4M AI gateway tags entries as
+	 * "chat" / "stt" / "tts"; we only expose chat models to pi. */
+	model_type?: string;
 }
 
 interface ModelsResponse {
@@ -104,7 +107,16 @@ async function fetchIn4mModels(
 	const list = payload.data ?? payload.models ?? [];
 
 	const models: OpenAIModel[] = list
-		.filter((m) => m && typeof m.id === "string" && m.id.length > 0)
+		.filter(
+			(m) =>
+				m &&
+				typeof m.id === "string" &&
+				m.id.length > 0 &&
+				// Only expose chat-capable models. The IN4M AI gateway lists STT
+				// (parakeet) and TTS (chatterbox) models alongside the LLM; those
+				// are not chat-completion models and would 502 if pi tried to use them.
+				(!m.model_type || m.model_type === "chat"),
+		)
 		.map((m) => {
 			const contextWindow = inferContextWindow(m.id, m.context_window ?? m.context_length);
 			const maxTokens = inferMaxTokens(m.id, m.max_tokens ?? m.max_output_tokens);
