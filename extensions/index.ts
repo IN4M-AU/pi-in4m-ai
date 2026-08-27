@@ -2,39 +2,39 @@
  * pi-in4m-ai — registers the IN4M AI server (https://ai.in4m.au) as a pi
  * provider.
  *
- * The server speaks the OpenAI Chat Completions API
- * (`POST /v1/chat/completions`, `GET /v1/models`), so this extension uses
- * pi-ai's built-in `openAICompletionsApi()` streaming implementation — no
- * custom streaming code, no reimplementation. Tool calling, streaming, and
- * usage accounting flow through pi's standard OpenAI-completions path.
+ * The server speaks the OpenAI Chat Completions API (`POST /v1/chat/completions`,
+ * `GET /v1/models`). This extension registers it via pi's config-form
+ * `registerProvider` with `api: "openai-completions"` — pi wires its built-in
+ * OpenAI-completions streaming (streamSimple etc.) itself, so there is no
+ * `createProvider` / `openAICompletionsApi` runtime import here.
  *
- * Auth: interactive API-key login via `/login in4m-ai` (prompted for a
- * secret), with an `IN4M_AI_API_KEY` env-var fallback.
+ * Auth: the `IN4M_AI_API_KEY` env var, resolved by pi as the Bearer key
+ * (`apiKey: "$IN4M_AI_API_KEY"`, `authHeader: true`). Set it in your shell or
+ * pi config: `export IN4M_AI_API_KEY=...`.
  *
- * Models: discovered dynamically from `GET /v1/models` after the key is
- * configured. The model list is persisted by pi's ModelsStore, so it survives
- * restarts and is available to `pi --list-models`.
+ * Models: discovered dynamically from `GET /v1/models`. Nothing model-related
+ * is hardcoded — context window, max output, cost, reasoning support and compat
+ * all come from the gateway (the source of truth), which reads them from the
+ * same env the llm-server enforces. Change a server setting, refresh in pi, and
+ * the catalog updates with no edit to this file.
  *
- * Nothing model-related is hardcoded here — context window, max output, cost,
- * reasoning support and compat all come from the gateway's /v1/models (which
- * reads them from the same env the llm-server enforces). Change a server
- * setting, refresh in pi, and the catalog updates with no edit to this file.
+ * Thinking is model-dictated and binary (Nemotron `/think` vs `/no_think`
+ * message markers). pi's 7 thinking levels collapse to off + on:
+ * `thinkingLevelMap` hides everything except `off` and `high` (the user's
+ * default level), and a `before_provider_request` hook injects the matching
+ * marker into the last user message each turn so pi's thinking toggle actually
+ * drives the gateway (the gateway's `thinking_enabled()` parses these
+ * markers).
  *
- * Thinking is model-dictated and binary (Nemotron /think vs /no_think message
- * markers). pi's 7 thinking levels collapse to off + on: `thinkingLevelMap`
- * hides everything except `off` and `high` (the user's default level), and a
- * `before_provider_request` hook injects the matching marker into the last
- * user message each turn so pi's thinking toggle actually drives the gateway
- * (the gateway's thinking_enabled() parses these markers).
+ * Only type-only imports are used (erased at runtime), so the extension has no
+ * runtime dependency on pi-ai — it loads cleanly under pi's jiti loader, which
+ * aliases pi-ai to a bundled module for the root/compat specifiers only (deep
+ * subpaths like `/api/openai-completions.lazy` are not aliased and fail to
+ * resolve on a fresh install).
  */
 
-import {
-	createProvider,
-	openAICompletionsApi,
-	type Model,
-	type RefreshModelsContext,
-} from "@earendil-works/pi-ai/compat";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { RefreshModelsContext } from "@earendil-works/pi-ai/compat";
+import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 
 const PROVIDER_ID = "in4m-ai";
 const PROVIDER_NAME = "IN4M AI";
@@ -43,8 +43,6 @@ const BASE_URL = (
 	process.env.IN4M_AI_BASE_URL ?? "https://ai.in4m.au/v1"
 ).replace(/\/+$/u, "");
 const ENV_KEY = "IN4M_AI_API_KEY";
-
-type OpenAIModel = Model<"openai-completions">;
 
 /** Subset of the gateway's enriched /v1/models entry. All fields optional
  * except id; the gateway always reports context/cost/reasoning/compat now. */
@@ -105,12 +103,15 @@ function prettyName(id: string): string {
 		.slice(0, 60);
 }
 
-/** Fetch the live model catalog from the server using the resolved credential.
- * Every capability field is read from the gateway (the source of truth). */
-async function fetchIn4mModels(
+/** Fetch the live model catalog from the server using the resolved credential
+ * (or the IN4M_AI_API_KEY env var as a fallback). Every capability field is
+ * read from the gateway (the source of truth). */
+async function refreshIn4mModels(
 	context: RefreshModelsContext,
-): Promise<readonly OpenAIModel[]> {
-	const key = context.credential?.type === "api_key" ? context.credential.key : undefined;
+): Promise<ProviderModelConfig[]> {
+	const key =
+		(context.credential?.type === "api_key" ? context.credential.key : undefined) ??
+		process.env[ENV_KEY];
 	if (!key) return [];
 
 	const response = await fetch(`${BASE_URL}/models`, {
@@ -135,7 +136,7 @@ async function fetchIn4mModels(
 	const payload = (await response.json()) as ModelsResponse;
 	const list = payload.data ?? payload.models ?? [];
 
-	const models: OpenAIModel[] = list
+	const models: ProviderModelConfig[] = list
 		.filter(
 			(m) =>
 				m &&
@@ -153,9 +154,6 @@ async function fetchIn4mModels(
 			return {
 				id: m.id,
 				name: m.name ?? prettyName(m.id),
-				api: "openai-completions" as const,
-				provider: PROVIDER_ID,
-				baseUrl: BASE_URL,
 				// Reasoning support is model-dictated and reported by the gateway.
 				reasoning: reasoningSupported,
 				// Binary model: collapse pi's 7 levels to off / on.
@@ -181,7 +179,7 @@ async function fetchIn4mModels(
 					requiresToolResultName: false,
 					thinkingFormat: "openai" as const,
 				},
-			} satisfies OpenAIModel;
+			} satisfies ProviderModelConfig;
 		});
 
 	// De-duplicate by id (some proxies repeat entries).
@@ -190,53 +188,18 @@ async function fetchIn4mModels(
 }
 
 export default function (pi: ExtensionAPI) {
-	const provider = createProvider({
-		id: PROVIDER_ID,
+	// Config-form registration: pi builds the provider and wires the built-in
+	// "openai-completions" streaming (streamSimple) itself. Auth is the
+	// IN4M_AI_API_KEY env var (Bearer). Models are discovered dynamically.
+	pi.registerProvider(PROVIDER_ID, {
 		name: PROVIDER_NAME,
 		baseUrl: BASE_URL,
-		api: openAICompletionsApi(),
+		apiKey: `$${ENV_KEY}`,
+		authHeader: true,
+		api: "openai-completions",
 		models: [],
-		fetchModels: fetchIn4mModels,
-		auth: {
-			apiKey: {
-				name: "IN4M AI API key",
-				async login(interaction) {
-					interaction.notify({
-						type: "info",
-						message: "Get an API key from the IN4M AI console at https://ai.in4m.au/console",
-						links: [{ url: "https://ai.in4m.au/console", label: "IN4M AI console" }],
-					});
-					const key = await interaction.prompt({
-						type: "secret",
-						message: "Paste your IN4M AI API key:",
-						placeholder: "sk-...",
-					});
-					if (!key || !key.trim()) throw new Error("No API key entered");
-					return { type: "api_key", key: key.trim() };
-				},
-				async resolve({ ctx, credential }) {
-					const stored = credential?.type === "api_key" ? credential.key : undefined;
-					if (stored) {
-						return { auth: { apiKey: stored }, source: "stored API key" };
-					}
-					const envKey = await ctx.env(ENV_KEY);
-					if (envKey) {
-						return { auth: { apiKey: envKey }, source: ENV_KEY };
-					}
-					return undefined;
-				},
-				async check({ ctx, credential }) {
-					const stored = credential?.type === "api_key" ? credential.key : undefined;
-					if (stored) return { type: "api_key", source: "stored API key" };
-					const envKey = await ctx.env(ENV_KEY);
-					if (envKey) return { type: "api_key", source: ENV_KEY };
-					return undefined;
-				},
-			},
-		},
+		refreshModels: refreshIn4mModels,
 	});
-
-	pi.registerProvider(provider);
 
 	// Drive the gateway's binary thinking from pi's thinking toggle. The
 	// gateway parses /think /no_think from user/system messages, so inject the
@@ -283,17 +246,17 @@ export default function (pi: ExtensionAPI) {
 			const auth = await registry.getProviderAuth(PROVIDER_ID);
 			if (!auth) {
 				ctx.ui.notify(
-					`IN4M AI: not configured. Run /login in4m-ai or set ${ENV_KEY}.`,
+					`IN4M AI: not configured. Set ${ENV_KEY} (e.g. export ${ENV_KEY}=sk-...).`,
 					"warning",
 				);
 				return;
 			}
 			const all = await registry.getAvailable();
 			const ids = all.filter((m) => m.provider === PROVIDER_ID).map((m) => m.id);
-			const head = ids.slice(0, 6).join(", ");
-			const more = ids.length > 6 ? ` (+${ids.length - 6} more)` : "";
 			ctx.ui.notify(
-				`IN4M AI: ${auth.source ?? "configured"} • ${ids.length} model${ids.length === 1 ? "" : "s"}${head ? `: ${head}` : ""}${more}`,
+				ids.length
+					? `IN4M AI: configured (${auth.source}). Models: ${ids.join(", ")}`
+					: `IN4M AI: configured (${auth.source}). No models yet — run /models --refresh.`,
 				"info",
 			);
 		},
