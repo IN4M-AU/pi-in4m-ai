@@ -30,10 +30,10 @@
 
 import {
 	createProvider,
+	openAICompletionsApi,
 	type Model,
 	type RefreshModelsContext,
-} from "@earendil-works/pi-ai";
-import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
+} from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const PROVIDER_ID = "in4m-ai";
