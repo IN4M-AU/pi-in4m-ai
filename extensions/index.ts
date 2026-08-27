@@ -14,41 +14,81 @@
  * Models: discovered dynamically from `GET /v1/models` after the key is
  * configured. The model list is persisted by pi's ModelsStore, so it survives
  * restarts and is available to `pi --list-models`.
+ *
+ * Nothing model-related is hardcoded here — context window, max output, cost,
+ * reasoning support and compat all come from the gateway's /v1/models (which
+ * reads them from the same env the llm-server enforces). Change a server
+ * setting, refresh in pi, and the catalog updates with no edit to this file.
+ *
+ * Thinking is model-dictated and binary (Nemotron /think vs /no_think message
+ * markers). pi's 7 thinking levels collapse to off + on: `thinkingLevelMap`
+ * hides everything except `off` and `high` (the user's default level), and a
+ * `before_provider_request` hook injects the matching marker into the last
+ * user message each turn so pi's thinking toggle actually drives the gateway
+ * (the gateway's thinking_enabled() parses these markers).
  */
 
 import {
 	createProvider,
-	openAICompletionsApi,
 	type Model,
 	type RefreshModelsContext,
 } from "@earendil-works/pi-ai";
+import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const PROVIDER_ID = "in4m-ai";
 const PROVIDER_NAME = "IN4M AI";
-const BASE_URL = "https://ai.in4m.au/v1";
+/** Gateway base URL. Override with IN4M_AI_BASE_URL (e.g. for local testing). */
+const BASE_URL = (
+	process.env.IN4M_AI_BASE_URL ?? "https://ai.in4m.au/v1"
+).replace(/\/+$/u, "");
 const ENV_KEY = "IN4M_AI_API_KEY";
 
 type OpenAIModel = Model<"openai-completions">;
 
+/** Subset of the gateway's enriched /v1/models entry. All fields optional
+ * except id; the gateway always reports context/cost/reasoning/compat now. */
 interface RemoteModel {
 	id: string;
 	name?: string;
+	model_type?: string;
 	context_window?: number;
 	context_length?: number;
 	max_tokens?: number;
 	max_output_tokens?: number;
-	object?: string;
-	owned_by?: string;
-	/** Gateway-supplied capability tag. The IN4M AI gateway tags entries as
-	 * "chat" / "stt" / "tts"; we only expose chat models to pi. */
-	model_type?: string;
+	reasoning?: { supported?: boolean; default_on?: boolean; levels?: string[] };
+	cost?: {
+		input_per_million_usd?: number;
+		output_per_million_usd?: number;
+		input_per_1k_cents?: number;
+		output_per_1k_cents?: number;
+	};
+	compat?: {
+		supports_reasoning_effort?: boolean;
+		supports_developer_role?: boolean;
+		max_tokens_field?: string;
+	};
 }
 
 interface ModelsResponse {
 	data?: RemoteModel[];
 	models?: RemoteModel[];
 }
+
+/** Binary thinking map: only `off` and `high` are offered. `off` -> off
+ * (no thinking), `high` -> on (thinking enabled). Every other level is hidden
+ * (null) — Nemotron has no minimal/low/medium/xhigh/max tiers (reasoning levels
+ * are model-dictated, not a setting we invent). `high` is kept (not a lower
+ * level) so a user whose defaultThinkingLevel is "high" lands on "on". */
+const BINARY_THINKING_MAP = {
+	off: "off",
+	minimal: null,
+	low: null,
+	medium: null,
+	high: "on",
+	xhigh: null,
+	max: null,
+} as const;
 
 /** Turn a raw model id into a human-friendly display name. */
 function prettyName(id: string): string {
@@ -65,19 +105,8 @@ function prettyName(id: string): string {
 		.slice(0, 60);
 }
 
-function inferContextWindow(id: string, reported?: number): number {
-	if (reported && reported > 0) return reported;
-	// NVIDIA Nemotron Ultra 253B / Nano 70B expose a 128K context window.
-	if (/nemotron/i.test(id)) return 128000;
-	return 128000;
-}
-
-function inferMaxTokens(id: string, reported?: number): number {
-	if (reported && reported > 0) return reported;
-	return 8192;
-}
-
-/** Fetch the live model catalog from the server using the resolved credential. */
+/** Fetch the live model catalog from the server using the resolved credential.
+ * Every capability field is read from the gateway (the source of truth). */
 async function fetchIn4mModels(
 	context: RefreshModelsContext,
 ): Promise<readonly OpenAIModel[]> {
@@ -89,8 +118,8 @@ async function fetchIn4mModels(
 		headers: {
 			Authorization: `Bearer ${key}`,
 			Accept: "application/json",
-			...(context.signal ? { signal: context.signal } : {}),
 		},
+		signal: context.signal ?? undefined,
 	});
 
 	if (!response.ok) {
@@ -112,41 +141,43 @@ async function fetchIn4mModels(
 				m &&
 				typeof m.id === "string" &&
 				m.id.length > 0 &&
-				// Only expose chat-capable models. The IN4M AI gateway lists STT
-				// (parakeet) and TTS (chatterbox) models alongside the LLM; those
-				// are not chat-completion models and would 502 if pi tried to use them.
+				// Only expose chat-capable models. The gateway lists STT (parakeet)
+				// and TTS (chatterbox) alongside the LLM; those aren't chat models.
 				(!m.model_type || m.model_type === "chat"),
 		)
 		.map((m) => {
-			const contextWindow = inferContextWindow(m.id, m.context_window ?? m.context_length);
-			const maxTokens = inferMaxTokens(m.id, m.max_tokens ?? m.max_output_tokens);
+			const reasoningSupported = m.reasoning?.supported === true;
+			// pi cost is per-million-token USD (rates.input/1e6 * tokens).
+			const c = m.cost ?? {};
+			const compat = m.compat ?? {};
 			return {
 				id: m.id,
 				name: m.name ?? prettyName(m.id),
 				api: "openai-completions" as const,
 				provider: PROVIDER_ID,
 				baseUrl: BASE_URL,
-				reasoning: false,
+				// Reasoning support is model-dictated and reported by the gateway.
+				reasoning: reasoningSupported,
+				// Binary model: collapse pi's 7 levels to off / on.
+				...(reasoningSupported ? { thinkingLevelMap: BINARY_THINKING_MAP } : {}),
 				input: ["text" as const],
 				cost: {
-					input: 0,
-					output: 0,
+					input: c.input_per_million_usd ?? 0,
+					output: c.output_per_million_usd ?? 0,
 					cacheRead: 0,
 					cacheWrite: 0,
 				},
-				contextWindow,
-				maxTokens,
-				// Explicit compat: this is an OpenAI-compatible gateway, not
-				// api.openai.com. Force conservative defaults so tool calls,
-				// max_tokens, and the system role serialize the way most
-				// compatible proxies expect.
+				contextWindow: m.context_window ?? m.context_length ?? 131072,
+				maxTokens: m.max_output_tokens ?? m.max_tokens ?? 8192,
+				// Compat from the gateway where it reports it; conservative defaults
+				// for the pi-internal fields the gateway doesn't speak.
 				compat: {
 					supportsStore: false,
-					supportsDeveloperRole: false,
-					supportsReasoningEffort: false,
+					supportsDeveloperRole: compat.supports_developer_role ?? false,
+					supportsReasoningEffort: compat.supports_reasoning_effort ?? false,
 					supportsStrictMode: false,
 					supportsUsageInStreaming: true,
-					maxTokensField: "max_tokens" as const,
+					maxTokensField: compat.max_tokens_field === "max_completion_tokens" ? "max_completion_tokens" : "max_tokens",
 					requiresToolResultName: false,
 					thinkingFormat: "openai" as const,
 				},
@@ -207,6 +238,30 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerProvider(provider);
 
+	// Drive the gateway's binary thinking from pi's thinking toggle. The
+	// gateway parses /think /no_think from user/system messages, so inject the
+	// marker for the current level into the last user message of each request.
+	pi.on("before_provider_request", (event, ctx) => {
+		if (ctx?.model?.provider !== PROVIDER_ID) return;
+		const level = pi.getThinkingLevel();
+		const marker = level === "off" ? "/no_think" : "/think";
+		const body = event.payload as { messages?: Array<{ role: string; content: unknown }> } | undefined;
+		const msgs = body?.messages;
+		if (!Array.isArray(msgs)) return;
+		for (let i = msgs.length - 1; i >= 0; i--) {
+			const m = msgs[i];
+			if (m.role !== "user") continue;
+			if (typeof m.content === "string") {
+				m.content = `${marker} ${m.content}`;
+			} else if (Array.isArray(m.content)) {
+				// multimodal: prepend a text part carrying the marker
+				m.content = [{ type: "text", text: marker }, ...m.content];
+			}
+			break;
+		}
+		return event.payload;
+	});
+
 	// Small status command: `/in4m-ai` reports auth + discovered models.
 	pi.registerCommand("in4m-ai", {
 		description: "Show IN4M AI provider status (auth source + available models)",
@@ -216,7 +271,7 @@ export default function (pi: ExtensionAPI) {
 			if (!auth) {
 				ctx.ui.notify(
 					`IN4M AI: not configured. Run /login in4m-ai or set ${ENV_KEY}.`,
-					"warn",
+					"warning",
 				);
 				return;
 			}
