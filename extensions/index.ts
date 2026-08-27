@@ -245,7 +245,20 @@ export default function (pi: ExtensionAPI) {
 		if (ctx?.model?.provider !== PROVIDER_ID) return;
 		const level = pi.getThinkingLevel();
 		const marker = level === "off" ? "/no_think" : "/think";
-		const body = event.payload as { messages?: Array<{ role: string; content: unknown }> } | undefined;
+		const body = event.payload as {
+			messages?: Array<{ role: string; content: unknown }>;
+			temperature?: number;
+			top_p?: number;
+		} | undefined;
+		if (body) {
+			// Sampling is the platform's responsibility (the inference server is
+			// sampling-agnostic). Nemotron's validated tool-call band is
+			// 0.5 / 0.95 (40/40 reliable calls); set it as pi's default. A user's
+			// explicit /temperature or per-request value always wins (only set
+			// when absent).
+			if (body.temperature === undefined) body.temperature = 0.5;
+			if (body.top_p === undefined) body.top_p = 0.95;
+		}
 		const msgs = body?.messages;
 		if (!Array.isArray(msgs)) return;
 		for (let i = msgs.length - 1; i >= 0; i--) {
