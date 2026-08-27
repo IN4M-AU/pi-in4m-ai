@@ -90,6 +90,41 @@ const BINARY_THINKING_MAP = {
 	max: null,
 } as const;
 
+/**
+ * Baked-in fallback catalog so the provider surfaces in pi immediately (in
+ * `--list-models` / `/model`) before the first live `fetchModels` refresh
+ * completes. Mirrors the pi-ollama-cloud GENERATED_MODELS pattern: pi-ai merges
+ * baseline models with dynamically-discovered ones, so a refresh later replaces
+ * these with the gateway's authoritative /v1/models entries. Only the chat
+ * model is listed (STT/TTS aren't chat models). Keep fields in sync with
+ * fetchIn4mModels' assembled shape.
+ */
+const FALLBACK_MODELS: OpenAIModel[] = [
+	{
+		id: "nemotron-3.5-lightning-30b-a3b",
+		name: "Nemotron 3.5 Lightning 30B A3B",
+		api: "openai-completions" as const,
+		provider: PROVIDER_ID,
+		baseUrl: BASE_URL,
+		reasoning: true,
+		thinkingLevelMap: BINARY_THINKING_MAP,
+		input: ["text" as const],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 131072,
+		maxTokens: 8192,
+		compat: {
+			supportsStore: false,
+			supportsDeveloperRole: false,
+			supportsReasoningEffort: false,
+			supportsStrictMode: false,
+			supportsUsageInStreaming: true,
+			maxTokensField: "max_tokens",
+			requiresToolResultName: false,
+			thinkingFormat: "openai" as const,
+		},
+	},
+];
+
 /** Turn a raw model id into a human-friendly display name. */
 function prettyName(id: string): string {
 	if (/nemotron/i.test(id)) {
@@ -195,7 +230,7 @@ export default function (pi: ExtensionAPI) {
 		name: PROVIDER_NAME,
 		baseUrl: BASE_URL,
 		api: openAICompletionsApi(),
-		models: [],
+		models: FALLBACK_MODELS,
 		fetchModels: fetchIn4mModels,
 		auth: {
 			apiKey: {
