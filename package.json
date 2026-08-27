@@ -15,9 +15,13 @@
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "@earendil-works/pi-ai": "^0.84.2"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.84.2"
+  },
   "devDependencies": {
-    "typescript": "^5.9.0",
-    "@earendil-works/pi-ai": "0.84.2",
-    "@earendil-works/pi-coding-agent": "0.84.2"
+    "typescript": "^5.9.0"
   }
 }
